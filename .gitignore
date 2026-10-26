@@ -1,0 +1,7 @@
+work/
+__pycache__/
+*.pyc
+*.tmp
+.venv*/
+*.onnx
+*.onnx_data
