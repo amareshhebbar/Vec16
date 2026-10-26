@@ -11,14 +11,25 @@ prompts:
   document: "passage: "
 
 sources:
-  - {key: msmarco, id: sentence-transformers/msmarco-bm25, config: triplet, share: 0.30}
+  - {key: msmarco, id: sentence-transformers/msmarco-bm25, config: triplet, share: 0.30, fill: true}
   - {key: nq, id: sentence-transformers/natural-questions, share: 0.16}
   - {key: hotpotqa, id: sentence-transformers/hotpotqa, config: triplet, share: 0.12}
   - {key: fever, id: sentence-transformers/fever, config: triplet, share: 0.08}
-  - {key: gooaq, id: sentence-transformers/gooaq, share: 0.14}
+  - {key: gooaq, id: sentence-transformers/gooaq, share: 0.14, fill: true}
   - {key: squad, id: sentence-transformers/squad, share: 0.07}
   - {key: triviaqa, id: sentence-transformers/trivia-qa, share: 0.07}
-  - {key: eli5, id: sentence-transformers/eli5, share: 0.06}
+  - {key: eli5, id: sentence-transformers/eli5, share: 0.06, fill: true}
+
+in_domain: [msmarco, nq, hotpotqa, fever]
+
+wikipedia:
+  id: wikimedia/wikipedia
+  config: 20231101.en
+  split: train
+  min_words: 30
+  max_words: 120
+  shard_size: 10000
+  snippet_chars: 280
 
 mntp_sources:
   - {id: HuggingFaceFW/fineweb-edu, config: sample-10BT, split: train, field: text}
@@ -57,7 +68,17 @@ profiles:
     save_steps: 0
     dev_max: 300
     eval_batch: 32
-    nanobeir: [scifact, nfcorpus, fiqa2018]
+    nanobeir: [scifact, nfcorpus, fiqa2018, nq]
+    train_queries: null
+    scaling_models: [smollm2_135m]
+    scaling_queries: [1000, 2000]
+    rescore_top: 100
+    bench_sizes: [100000]
+    bench_float_max: 100000
+    bench_queries: 200
+    demo: true
+    demo_model: smollm2_135m
+    demo_passages: 20000
     repo_suffix: _smoke
     private: true
     collect_all: true
@@ -68,12 +89,12 @@ profiles:
       reference_ratio: null
       private_if_bad: false
   full:
-    queries: 100000
+    queries: 500000
     dev_queries: 2000
     teacher_dense: Qwen/Qwen3-Embedding-8B
     teacher_k: 32
     teacher_batch: 128
-    colbert_chunk: 1024
+    colbert_chunk: 2048
     query_len: 64
     doc_len: 160
     mntp_docs: 60000
@@ -93,6 +114,16 @@ profiles:
     dev_max: 2000
     eval_batch: 128
     nanobeir: [arguana, climatefever, dbpedia, fever, fiqa2018, hotpotqa, msmarco, nfcorpus, nq, quoraretrieval, scidocs, scifact, touche2020]
+    train_queries: 100000
+    scaling_models: [smollm2_360m]
+    scaling_queries: [50000, 250000, 500000]
+    rescore_top: 100
+    bench_sizes: [1000000, 10000000]
+    bench_float_max: 1000000
+    bench_queries: 1000
+    demo: true
+    demo_model: smollm2_135m
+    demo_passages: null
     repo_suffix: ""
     private: false
     collect_all: true
@@ -197,6 +228,7 @@ ablations:
 
 select_metric: mixed
 verdict_bits: 128
+verdict_split: ood
 onnx_max_params: 1.0e9
 
 train:
