@@ -153,40 +153,96 @@ def build_section(cfg, s):
     ]
 
 
+SPLIT_KEY = {"all": "mean", "ood": "mean_ood", "ind": "mean_ind"}
+SPLIT_NAME = {"all": "all sets", "ood": "out of domain", "ind": "in domain"}
+
+
+def bget(res, kind, dim, split):
+    if not res:
+        return None
+    b = res.get(SPLIT_KEY[split]) or {}
+    return b.get(kind, {}).get(str(dim))
+
+
 def results(cfg, s, bres):
     full, bits = s["full_dim"], s["bits"]
-    t = s["tuned"]
+    bys = s["by_split"]
+    vs = s["split"]
+    ood_names = s["main"].get("splits", {}).get("ood", [])
+    ind_names = s["main"].get("splits", {}).get("in_domain", [])
+    cols = [sp for sp in ("ood", "ind", "all") if bys[sp]["float"]]
+    head = " | ".join(f"{SPLIT_NAME[c]} ({len(ood_names) if c == 'ood' else len(ind_names) if c == 'ind' else len(ood_names) + len(ind_names)})" for c in cols)
+    sep = "|".join(["---"] * (len(cols) + 2))
+
+    def row(label, nb, key):
+        return f"| {label} | {nb} | " + " | ".join((("**" + ms(bys[c][key]) + "**") if key == "binary" else ms(bys[c][key])) for c in cols) + " |"
+
+    base_cells = " | ".join(pct(s["base_by_split"][c]) for c in cols)
     rows = [
         "## Results",
         "",
-        f"NanoBEIR, {len(cfg['run']['nanobeir'])} datasets, mean nDCG@10. ± is the standard deviation over seeds.",
+        "NanoBEIR mean nDCG@10, ± is the standard deviation over seeds.",
+        f"Out of domain: {', '.join(ood_names) or 'none'}. In domain: {', '.join(ind_names) or 'none'}. The train splits of the in domain sets are part of the training data, so the out of domain column is the honest number. The verdict uses {SPLIT_NAME[vs]}.",
         "",
-        "| Setting | Bytes per document | nDCG@10 |",
-        "|---|---|---|",
-        f"| Starting LLM, causal, mean pooled, float32 {full} | {nbytes(full, 'float')} | {pct(s['base_float'])} |",
-        f"| Vec16 float32 {full} | {nbytes(full, 'float')} | {ms(t['float'])} |",
-        f"| Vec16 float32 128 | {nbytes(128, 'float')} | {ms(t['float128'])} |",
-        f"| Vec16 binary {bits} bits | {nbytes(bits, 'binary')} | **{ms(t['binary'])}** |",
-        f"| Vec16 float query, binary {bits} bit documents | {nbytes(bits, 'binary')} | {ms(t['asym'])} |",
+        f"| Setting | Bytes per document in RAM | {head} |",
+        f"|{sep}|",
+        f"| Starting LLM, causal, mean pooled, float32 {full} | {nbytes(full, 'float')} | {base_cells} |",
+        row(f"Vec16 float32 {full}", nbytes(full, "float"), "float"),
+        row("Vec16 float32 128", nbytes(128, "float"), "float128"),
+        row(f"Vec16 binary {bits} bits", nbytes(bits, "binary"), "binary"),
+        row(f"Vec16 binary {bits} bits, top {cfg['run'].get('rescore_top', 100)} rescored with the float query", nbytes(bits, "binary"), "rescore"),
+        row(f"Vec16 binary {bits} bits, top {cfg['run'].get('rescore_top', 100)} rescored with float32 vectors kept on disk", f"{nbytes(bits, 'binary')} (+{nbytes(full, 'float')} on disk)", "rescore_full"),
+        row(f"Vec16 float query against binary {bits} bit documents", nbytes(bits, "binary"), "asym"),
         "",
         f"Verdict: **{'GOOD' if s['good'] else 'BAD'}**. {'; '.join(s['reasons'])}.",
         "",
     ]
-    if bres:
-        rows += ["### Against public embedders", "", "| Model | Dims | float32 bytes | float32 nDCG@10 | binary bytes | binary nDCG@10 |", "|---|---|---|---|---|---|"]
-        for k, r in bres.items():
-            d = r["dim"]
-            rows.append(f"| {r['label']} | {d} | {nbytes(d, 'float')} | {pct(r['mean']['float'].get(str(d)))} | {nbytes(d, 'binary')} | {pct(r['mean']['binary'].get(str(d)))} |")
-        rows.append(f"| **Vec16 {cfg['models'][s['model']]['tail'].replace('_', ' ')}** | {full} | {nbytes(full, 'float')} | {pct(t['float']['mean'] if t['float'] else None)} | **{nbytes(bits, 'binary')}** ({bits} bits) | **{pct(t['binary']['mean'] if t['binary'] else None)}** |")
+    t = s["tuned"]
+    vb = t["binary"]["mean"] if t["binary"] else None
+    if s.get("binarized"):
+        rows += [
+            f"### Against simply binarizing a strong embedder at {bits} bits",
+            "",
+            f"Matryoshka embedders can be cut to {bits} dimensions and binarized without any training. This is the shortcut Vec16 has to beat. ({SPLIT_NAME[vs]})",
+            "",
+            f"| Model | Params | {bits} bits nDCG@10 | its own float32 nDCG@10 |",
+            "|---|---|---|---|",
+        ]
+        for b in s["binarized"]:
+            rows.append(f"| {b['label']} binarized | | {pct(b['binary'])} | {pct(b['float'])} |")
+        rows.append(f"| **Vec16 {cfg['models'][s['model']]['tail'].replace('_', ' ')}** | {s['params'] / 1e6:.0f}M | **{pct(vb)}** | {pct(t['float']['mean'] if t['float'] else None)} |")
         rows.append("")
-    main = s["main"]["mean"]
+    ts = s.get("teacher_scores") or {}
+    if ts:
+        rows += [f"### Against the teachers ({SPLIT_NAME[vs]})", "", "| Teacher | Bytes per document | nDCG@10 | Vec16 at " + str(bits // 8) + " bytes keeps |", "|---|---|---|---|"]
+        d = ts.get("teacher_dense")
+        if d:
+            df = bget(d, "float", d["dim"], vs) or bget(d, "float", d["dim"], "all")
+            rows.append(f"| {d['id']} float32 {d['dim']} | {nbytes(d['dim'], 'float')} | {pct(df)} | {pct(vb / df) if vb and df else 'n/a'}% |")
+            db = bget(d, "binary", bits, vs) or bget(d, "binary", bits, "all")
+            if db is not None:
+                rows.append(f"| {d['id']} binary {bits} bits | {nbytes(bits, 'binary')} | {pct(db)} | {pct(vb / db) if vb and db else 'n/a'}% |")
+        c = ts.get("teacher_colbert")
+        if c:
+            cl = c.get("late_ood") if vs == "ood" and c.get("late_ood") is not None else c.get("late")
+            rows.append(f"| {c['id']} late interaction | about {c['bytes_per_doc']:,.0f} | {pct(cl)} | {pct(vb / cl) if vb and cl else 'n/a'}% |")
+        rows.append("")
+    if bres:
+        rows += [f"### Against public embedders ({SPLIT_NAME[vs]})", "", "| Model | Dims | float32 bytes | float32 nDCG@10 | binary bytes | binary nDCG@10 |", "|---|---|---|---|---|---|"]
+        for k, r in bres.items():
+            dd = r["dim"]
+            rows.append(f"| {r['label']} | {dd} | {nbytes(dd, 'float')} | {pct(bget(r, 'float', dd, vs))} | {nbytes(dd, 'binary')} | {pct(bget(r, 'binary', dd, vs))} |")
+        rows.append(f"| **Vec16 {cfg['models'][s['model']]['tail'].replace('_', ' ')}** | {full} | {nbytes(full, 'float')} | {pct(t['float']['mean'] if t['float'] else None)} | **{nbytes(bits, 'binary')}** ({bits} bits) | **{pct(vb)}** |")
+        rows.append("")
+    main = s["main"].get(SPLIT_KEY[vs]) or s["main"]["mean"]
     dims = sorted((int(d) for d in main["float"]), reverse=True)
-    rows += ["### Quality by vector size", "", "| Dims | float32 bytes | float32 | binary bytes | binary | float query, binary docs |", "|---|---|---|---|---|---|"]
+    rows += [f"### Quality by vector size ({SPLIT_NAME[vs]}, main branch)", "", "| Dims | float32 bytes | float32 | binary bytes | binary | binary, rescored | float query, binary docs |", "|---|---|---|---|---|---|---|"]
     for d in dims:
-        rows.append(f"| {d} | {nbytes(d, 'float')} | {pct(main['float'].get(str(d)))} | {nbytes(d, 'binary') if str(d) in main['binary'] else ''} | {pct(main['binary'].get(str(d))) if str(d) in main['binary'] else ''} | {pct(main['asym'].get(str(d))) if str(d) in main['asym'] else ''} |")
+        has = str(d) in main.get("binary", {})
+        rows.append(f"| {d} | {nbytes(d, 'float')} | {pct(main['float'].get(str(d)))} | {nbytes(d, 'binary') if has else ''} | {pct(main['binary'].get(str(d))) if has else ''} | {pct(main.get('rescore', {}).get(str(d))) if has else ''} | {pct(main['asym'].get(str(d))) if has else ''} |")
     rows.append("")
     if s["teachers"]:
-        rows += ["### Which teacher", "", "| Branch | Teacher | float32 | binary " + str(bits) + " | dev |", "|---|---|---|---|---|"]
+        rows += [f"### Which teacher ({SPLIT_NAME[vs]})", "", "| Branch | Teacher | float32 | binary " + str(bits) + " | dev |", "|---|---|---|---|---|"]
         names = {"dense": cfg["run"]["teacher_dense"], "colbert": cfg["teachers"]["colbert"], "fused": "both, averaged"}
         for v, r in s["teachers"].items():
             mark = " (main)" if v == s["headline"]["variant"] else ""
@@ -194,11 +250,67 @@ def results(cfg, s, bres):
         rows.append("")
     if s["ablations"]:
         desc = {"full method": "everything", "no_mntp": "skip masked next token training", "no_qat": "no binary aware loss", "no_listwise": "contrastive loss only, no teacher", "causal": "keep causal attention"}
-        rows += ["### Ablation", "", "| Branch | Change | float32 | binary " + str(bits) + " |", "|---|---|---|---|"]
+        rows += [f"### Ablation ({SPLIT_NAME[vs]})", "", "| Branch | Change | float32 | binary " + str(bits) + " |", "|---|---|---|---|"]
         for v, r in s["ablations"].items():
             rows.append(f"| `{v}` | {desc.get(v, v)} | {pct(r['float'])} | {pct(r['binary'])} |")
         rows.append("")
+    if len(s.get("scaling") or []) >= 2:
+        rows += ["### More training data", "", "Same student, same teacher, seed 0, only the number of training queries changes (out of domain when available).", "", "| Training queries | float32 | binary " + str(bits) + " |", "|---|---|---|"]
+        for p in s["scaling"]:
+            rows.append(f"| {p['queries']:,} | {pct(p['float'])} | {pct(p['binary'])} |")
+        rows.append("")
     return rows
+
+
+def speed_section(cfg, s):
+    import json
+
+    onnx = cfg["paths"]["runs"] / s["model"] / "onnx" / "export.json"
+    bench = cfg["paths"]["results"] / "bench.json"
+    lines = []
+    if onnx.exists() or bench.exists():
+        lines += ["## Speed and size", ""]
+    if onnx.exists():
+        e = json.loads(onnx.read_text())
+        lines += ["| Build | Parity with PyTorch (min cosine) | CPU documents per second |", "|---|---|---|"]
+        for k, name in (("fp32", "ONNX float32"), ("int8", "ONNX int8")):
+            if k in e:
+                c = e[k].get("cpu", {})
+                lines.append(f"| {name} | {e[k]['parity_cosine']:.4f} | {c.get('docs_per_second', 'n/a')} |")
+        c = e.get("fp32", {}).get("cpu", {})
+        lines += ["", f"Measured on `{e.get('cpu_name', 'cpu')}` with {c.get('threads', '?')} threads, batches of {c.get('batch', 32)}, {c.get('words_per_doc', 100)} word passages.", ""]
+    if bench.exists():
+        b = json.loads(bench.read_text())
+        lines += ["| Index | Documents | Size | Queries per second | p50 latency |", "|---|---|---|---|---|"]
+        for r in b["rows"]:
+            size = r["bytes"] / 1024**3
+            sz = f"{size:,.2f} GB" if size >= 1 else f"{r['bytes'] / 1024**2:,.0f} MB"
+            qps = f"{r['qps']:,.0f}" if r.get("qps") else "too big to load"
+            lat = f"{r['latency_ms']} ms" if r.get("latency_ms") is not None else ""
+            lines.append(f"| {r['label']} | {r['n']:,} | {sz} | {qps} | {lat} |")
+        lines += ["", f"FAISS {b['faiss']} flat exact search on {b['threads']} CPU threads. {b['note']}", ""]
+    return lines
+
+
+def findings_section(s):
+    if not s.get("findings"):
+        return []
+    return ["## What did not work", ""] + [f"* {f}" for f in s["findings"]] + [""]
+
+
+def demo_section(cfg):
+    import json
+
+    p = cfg["paths"]["results"] / "demo.json"
+    if not p.exists():
+        return []
+    d = json.loads(p.read_text())
+    return [
+        "## Try it",
+        "",
+        f"[Search {d['count']:,} Wikipedia passages in your browser](https://huggingface.co/spaces/{d['space']}). The whole index is {d['bytes'] / 1024**2:.0f} MB of {d['bits']} bit codes and the search runs in the tab.",
+        "",
+    ]
 
 
 def config_section(cfg, s):
@@ -241,12 +353,15 @@ def model_card(cfg, mkey, s, bres, present, leaderboard=None):
     if "curve.png" in present:
         lines += ["![Quality against bytes per document](assets/curve.png)", ""]
     lines += results(cfg, s, bres)
-    for f, alt in (("mrl.png", "Quality by vector size"), ("teachers.png", "Teacher comparison"), ("ablation.png", "Ablation"), ("loss.png", "Training curve")):
+    for f, alt in (("mrl.png", "Quality by vector size"), ("teachers.png", "Teacher comparison"), ("ablation.png", "Ablation"), ("data_scaling.png", "More training data"), ("loss.png", "Training curve")):
         if f in present:
             lines += [f"![{alt}](assets/{f})", ""]
     if leaderboard:
         lines += ["### Every Vec16 model", ""] + leaderboard + [""]
+    lines += findings_section(s)
+    lines += demo_section(cfg)
     lines += usage(cfg, s)
+    lines += speed_section(cfg, s)
     lines += build_section(cfg, s)
     lines += config_section(cfg, s)
     lines += [
@@ -256,12 +371,12 @@ def model_card(cfg, mkey, s, bres, present, leaderboard=None):
         "* Matryoshka Representation Learning (Kusupati et al., 2022) and binary embedding quantization (Shakir, Aarsen and Lee, 2024) shrink vectors after training or with light tuning.",
         "* ColBERTv2 and later work distill rankings from stronger teachers into retrievers.",
         "",
-        "New here: all of these in one sub 2B decoder, binary aware training at every Matryoshka size, a direct comparison of a single vector teacher, a late interaction teacher and both fused, and one curve of quality against bytes stored for every student and five larger public embedders.",
+        "New here: all of these in one sub 2B decoder, binary aware training at every Matryoshka size, a direct comparison of a single vector teacher, a late interaction teacher and both fused, a comparison against simply binarizing a strong Matryoshka embedder, and one curve of quality against bytes stored for every student, both teachers and the public embedders.",
         "",
         "## Limitations",
         "",
         "* NanoBEIR has 50 queries per dataset, so small gaps are noise. The seed spread is reported for that reason.",
-        "* Training used the train splits of MS MARCO, Natural Questions, HotpotQA and FEVER, so those four NanoBEIR sets are in domain.",
+        "* Training used the train splits of MS MARCO, Natural Questions, HotpotQA and FEVER, so those four NanoBEIR sets are in domain. They are reported separately and the verdict uses the out of domain sets.",
         "* English only. Documents longer than 512 tokens are cut.",
         "* Binary vectors below 128 bits produce many tied scores.",
         "",
@@ -360,6 +475,8 @@ def dataset_card(cfg, info):
     lines += [
         "",
         f"Dense teacher top 1 equals the labeled positive for {info['dense']['top1_is_positive'] * 100:.1f}% of queries. The two teachers agree on the top candidate for {info['colbert']['top1_agree_with_dense'] * 100:.1f}% of queries.",
+        "",
+        f"For {info.get('false_negative_rate', 0) * 100:.1f}% of training queries both teachers score another candidate clearly above the labeled positive. Those are usually correct answers that were never labeled, so training does not push them away. Examples are in [false_negatives.md](false_negatives.md).",
         "",
         "Every source keeps its own license. Check them before commercial use.",
         "",
