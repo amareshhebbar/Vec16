@@ -92,19 +92,57 @@ def chunked_scores(q, d, chunk=4096):
     return torch.cat(out)
 
 
-def score_grid(q, d, qrels, float_dims, binary_dims, k=10):
-    res = {"float": {}, "binary": {}, "asym": {}}
+def rescored(coarse, fine, top):
+    top = min(top, coarse.shape[1])
+    idx = torch.topk(coarse, top, dim=1).indices
+    out = torch.full_like(fine, float("-inf"))
+    out.scatter_(1, idx, fine.gather(1, idx))
+    return out
+
+
+def score_grid(q, d, qrels, float_dims, binary_dims, k=10, rescore_top=100):
+    res = {"float": {}, "binary": {}, "asym": {}, "rescore": {}, "rescore_full": {}}
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     q, d = q.to(dev), d.to(dev)
+    full = max(float_dims) if float_dims else q.shape[1]
+    ff = chunked_scores(F.normalize(q[:, :full], dim=-1), F.normalize(d[:, :full], dim=-1))
     for dim in float_dims:
         qq, dd = F.normalize(q[:, :dim], dim=-1), F.normalize(d[:, :dim], dim=-1)
         res["float"][str(dim)] = ndcg_at_k(chunked_scores(qq, dd), qrels, k)
     for dim in binary_dims:
         qb, db = binarize(q[:, :dim]), binarize(d[:, :dim])
-        res["binary"][str(dim)] = ndcg_at_k(chunked_scores(qb, db), qrels, k)
+        sb = chunked_scores(qb, db)
+        res["binary"][str(dim)] = ndcg_at_k(sb, qrels, k)
         qf = F.normalize(q[:, :dim], dim=-1)
-        res["asym"][str(dim)] = ndcg_at_k(chunked_scores(qf, db), qrels, k)
+        sa = chunked_scores(qf, db)
+        res["asym"][str(dim)] = ndcg_at_k(sa, qrels, k)
+        res["rescore"][str(dim)] = ndcg_at_k(rescored(sb, sa, rescore_top), qrels, k)
+        res["rescore_full"][str(dim)] = ndcg_at_k(rescored(sb, ff, rescore_top), qrels, k)
     return res
+
+
+KINDS = ("float", "binary", "asym", "rescore", "rescore_full")
+
+
+def aggregate(per, names, float_dims, binary_dims):
+    names = [n for n in names if n in per]
+    if not names:
+        return None
+    agg = {}
+    for kind in KINDS:
+        agg[kind] = {}
+        dims = float_dims if kind == "float" else binary_dims
+        for dim in dims:
+            vals = [per[n][kind][str(dim)] for n in names if str(dim) in per[n].get(kind, {})]
+            if vals:
+                agg[kind][str(dim)] = sum(vals) / len(vals)
+    return agg
+
+
+def splits(cfg):
+    ind = set(cfg.get("in_domain") or [])
+    names = list(cfg["run"]["nanobeir"])
+    return names, [n for n in names if n not in ind], [n for n in names if n in ind]
 
 
 def evaluate_nano(cfg, model, qprompt, dprompt, float_dims, binary_dims):
@@ -114,15 +152,57 @@ def evaluate_nano(cfg, model, qprompt, dprompt, float_dims, binary_dims):
         data = load_nano(cfg, name)
         q = encode(model, data["queries"], qprompt, run["eval_batch"])
         d = encode(model, data["docs"], dprompt, run["eval_batch"])
-        per[name] = score_grid(q, d, data["qrels"], float_dims, binary_dims)
+        per[name] = score_grid(q, d, data["qrels"], float_dims, binary_dims, rescore_top=run.get("rescore_top", 100))
         del q, d
-    agg = {}
-    for kind in ("float", "binary", "asym"):
-        agg[kind] = {}
-        dims = float_dims if kind == "float" else binary_dims
-        for dim in dims:
-            vals = [per[n][kind][str(dim)] for n in per]
-            agg[kind][str(dim)] = sum(vals) / len(vals)
+    names, ood, ind = splits(cfg)
     full = max(float_dims)
     log("nanobeir " + " ".join(f"{n}={per[n]['float'][str(full)]:.3f}" for n in per))
-    return {"mean": agg, "detail": per, "full_dim": full}
+    return {
+        "mean": aggregate(per, names, float_dims, binary_dims),
+        "mean_ood": aggregate(per, ood, float_dims, binary_dims),
+        "mean_ind": aggregate(per, ind, float_dims, binary_dims),
+        "splits": {"ood": ood, "in_domain": ind},
+        "detail": per,
+        "full_dim": full,
+    }
+
+
+def evaluate_nano_late(cfg, model, batch=32):
+    from torch.nn.utils.rnn import pad_sequence
+
+    run = cfg["run"]
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    per, tokens = {}, []
+    for name in run["nanobeir"]:
+        data = load_nano(cfg, name)
+        with torch.inference_mode():
+            qt = model.encode(data["queries"], batch_size=batch, is_query=True, convert_to_numpy=False, show_progress_bar=False)
+            dt = model.encode(data["docs"], batch_size=batch, is_query=False, convert_to_numpy=False, show_progress_bar=False)
+        tokens += [t.shape[0] for t in dt]
+        dl = torch.tensor([t.shape[0] for t in dt])
+        dx = pad_sequence([t.float().cpu() for t in dt], batch_first=True)
+        dm = torch.arange(dx.shape[1])[None, :] < dl[:, None]
+        scores = torch.zeros(len(qt), len(dt))
+        step = 512
+        for j in range(0, len(dt), step):
+            x = dx[j : j + step].to(dev)
+            m = dm[j : j + step].to(dev)
+            for i, q in enumerate(qt):
+                sim = torch.einsum("qh,dlh->dql", q.float().to(dev), x).masked_fill(~m[:, None, :], -1e4)
+                scores[i, j : j + step] = (sim.max(-1).values.sum(-1) / q.shape[0]).cpu()
+        per[name] = {"late": ndcg_at_k(scores, data["qrels"])}
+    names, ood, ind = splits(cfg)
+
+    def avg(ns):
+        ns = [n for n in ns if n in per]
+        return sum(per[n]["late"] for n in ns) / len(ns) if ns else None
+
+    dim = int(qt[0].shape[1])
+    return {
+        "late": avg(names),
+        "late_ood": avg(ood),
+        "late_ind": avg(ind),
+        "detail": per,
+        "token_dim": dim,
+        "bytes_per_doc": float(sum(tokens) / max(1, len(tokens)) * dim * 2),
+    }
