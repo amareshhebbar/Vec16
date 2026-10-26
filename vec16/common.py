@@ -250,9 +250,23 @@ def variant_spec(cfg, vname, headline_teacher=None):
     elif vname in cfg["ablations"]:
         base["teacher"] = headline_teacher or "fused"
         base.update(cfg["ablations"][vname])
+    elif vname.startswith("scale_"):
+        base["teacher"] = headline_teacher or "fused"
+        base["train_queries"] = int(vname.split("_", 1)[1])
     else:
         raise KeyError(vname)
     return base
+
+
+def train_queries(cfg, mkey, spec):
+    n = spec.get("train_queries") or cfg["models"][mkey].get("train_queries") or cfg["run"].get("train_queries")
+    return int(n) if n else None
+
+
+def scale_variants(cfg, mkey):
+    if mkey not in (cfg["run"].get("scaling_models") or []):
+        return []
+    return [f"scale_{n}" for n in cfg["run"].get("scaling_queries") or []]
 
 
 def status_path(cfg):
