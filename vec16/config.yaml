@@ -1,0 +1,218 @@
+project:
+  name: Vec16
+  hf_user: AmareshHebbar
+  github: amareshhebbar/vec16
+  dataset_tail: Distill
+  collection_title: Vec16 Embeddings
+  collection_description: Small decoder LLMs turned into bidirectional embedders. Distilled from a dense and a late interaction teacher, Matryoshka and binary ready. One document in 16 bytes.
+
+prompts:
+  query: "query: "
+  document: "passage: "
+
+sources:
+  - {key: msmarco, id: sentence-transformers/msmarco-bm25, config: triplet, share: 0.30}
+  - {key: nq, id: sentence-transformers/natural-questions, share: 0.16}
+  - {key: hotpotqa, id: sentence-transformers/hotpotqa, config: triplet, share: 0.12}
+  - {key: fever, id: sentence-transformers/fever, config: triplet, share: 0.08}
+  - {key: gooaq, id: sentence-transformers/gooaq, share: 0.14}
+  - {key: squad, id: sentence-transformers/squad, share: 0.07}
+  - {key: triviaqa, id: sentence-transformers/trivia-qa, share: 0.07}
+  - {key: eli5, id: sentence-transformers/eli5, share: 0.06}
+
+mntp_sources:
+  - {id: HuggingFaceFW/fineweb-edu, config: sample-10BT, split: train, field: text}
+  - {id: wikimedia/wikipedia, config: 20231101.en, split: train, field: text}
+
+teachers:
+  dense_query_prompt: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+  dense_doc_prompt: ""
+  colbert: lightonai/GTE-ModernColBERT-v1
+  temp_dense: 0.02
+  temp_colbert: 0.02
+
+profiles:
+  small:
+    queries: 3000
+    dev_queries: 300
+    teacher_dense: Qwen/Qwen3-Embedding-0.6B
+    teacher_k: 16
+    teacher_batch: 32
+    colbert_chunk: 256
+    query_len: 64
+    doc_len: 192
+    mntp_docs: 3000
+    mntp_tokens: 1000000
+    mntp_seq: 256
+    mntp_batch: 8
+    models: [smollm2_135m]
+    ablation_models: [smollm2_135m]
+    baselines: [minilm_l6, bge_small]
+    reference: minilm_l6
+    seeds: [0]
+    train_k: 4
+    batch_size: 16
+    epochs: 1
+    eval_steps: 50
+    save_steps: 0
+    dev_max: 300
+    eval_batch: 32
+    nanobeir: [scifact, nfcorpus, fiqa2018]
+    repo_suffix: _smoke
+    private: true
+    collect_all: true
+    onnx: true
+    verdict:
+      min_gain: 0.0
+      min_binary_ratio: 0.6
+      reference_ratio: null
+      private_if_bad: false
+  full:
+    queries: 100000
+    dev_queries: 2000
+    teacher_dense: Qwen/Qwen3-Embedding-8B
+    teacher_k: 32
+    teacher_batch: 128
+    colbert_chunk: 1024
+    query_len: 64
+    doc_len: 160
+    mntp_docs: 60000
+    mntp_tokens: 20000000
+    mntp_seq: 512
+    mntp_batch: 16
+    models: [smollm2_135m, smollm2_360m, gemma3_270m, qwen25_05b, qwen3_06b, qwen3_17b]
+    ablation_models: [smollm2_360m, qwen3_06b]
+    baselines: [minilm_l6, bge_large, e5_large, mxbai_large, qwen3_emb_06b, embeddinggemma_300m]
+    reference: minilm_l6
+    seeds: [0, 1, 2]
+    train_k: 6
+    batch_size: 32
+    epochs: 1
+    eval_steps: 500
+    save_steps: 1000
+    dev_max: 2000
+    eval_batch: 128
+    nanobeir: [arguana, climatefever, dbpedia, fever, fiqa2018, hotpotqa, msmarco, nfcorpus, nq, quoraretrieval, scidocs, scifact, touche2020]
+    repo_suffix: ""
+    private: false
+    collect_all: true
+    onnx: true
+    verdict:
+      min_gain: 0.05
+      min_binary_ratio: 0.85
+      reference_ratio: 1.0
+      private_if_bad: true
+
+models:
+  smollm2_135m:
+    id: HuggingFaceTB/SmolLM2-135M
+    tail: SmolLM2_135M
+    license: apache-2.0
+    vllm_arch: LlamaModel
+  smollm2_360m:
+    id: HuggingFaceTB/SmolLM2-360M
+    tail: SmolLM2_360M
+    license: apache-2.0
+    vllm_arch: LlamaModel
+  gemma3_270m:
+    id: google/gemma-3-270m
+    tail: Gemma3_270M
+    license: gemma
+    gated: true
+    no_fp16: true
+    vllm_arch: Gemma3TextModel
+  qwen25_05b:
+    id: Qwen/Qwen2.5-0.5B
+    tail: Qwen2.5_0.5B
+    license: apache-2.0
+    vllm_arch: Qwen2Model
+  qwen3_06b:
+    id: Qwen/Qwen3-0.6B-Base
+    tail: Qwen3_0.6B
+    license: apache-2.0
+    vllm_arch: Qwen3ForCausalLM
+  qwen3_17b:
+    id: Qwen/Qwen3-1.7B-Base
+    tail: Qwen3_1.7B
+    license: apache-2.0
+    vllm_arch: Qwen3ForCausalLM
+    lr: 1.0e-5
+    batch_size: 16
+    mntp_batch: 8
+
+baselines:
+  minilm_l6:
+    id: sentence-transformers/all-MiniLM-L6-v2
+    label: all MiniLM L6 v2
+  bge_small:
+    id: BAAI/bge-small-en-v1.5
+    label: bge small en v1.5
+    query_prompt: "Represent this sentence for searching relevant passages: "
+  bge_large:
+    id: BAAI/bge-large-en-v1.5
+    label: bge large en v1.5
+    query_prompt: "Represent this sentence for searching relevant passages: "
+  e5_large:
+    id: intfloat/e5-large-v2
+    label: e5 large v2
+    query_prompt: "query: "
+    doc_prompt: "passage: "
+  mxbai_large:
+    id: mixedbread-ai/mxbai-embed-large-v1
+    label: mxbai embed large v1
+    mrl: true
+    query_prompt: "Represent this sentence for searching relevant passages: "
+  qwen3_emb_06b:
+    id: Qwen/Qwen3-Embedding-0.6B
+    label: Qwen3 Embedding 0.6B
+    mrl: true
+    query_prompt: "Instruct: Given a web search query, retrieve relevant passages that answer the query\nQuery:"
+  embeddinggemma_300m:
+    id: google/embeddinggemma-300m
+    label: EmbeddingGemma 300M
+    gated: true
+    no_fp16: true
+    mrl: true
+    query_prompt: "task: search result | query: "
+    doc_prompt: "title: none | text: "
+
+defaults:
+  teacher: fused
+  bidir: true
+  mntp: true
+  qat: true
+  listwise: true
+  contrastive: true
+
+variants:
+  dense: {teacher: dense}
+  colbert: {teacher: colbert}
+  fused: {teacher: fused}
+
+ablations:
+  no_mntp: {mntp: false}
+  no_qat: {qat: false}
+  no_listwise: {listwise: false}
+  causal: {bidir: false, mntp: false}
+
+select_metric: mixed
+verdict_bits: 128
+onnx_max_params: 1.0e9
+
+train:
+  lr: 3.0e-5
+  mntp_lr: 5.0e-5
+  mntp_mask: 0.2
+  warmup_ratio: 0.05
+  weight_decay: 0.01
+  grad_clip: 1.0
+  temp_nce: 0.05
+  temp_list: 0.02
+  w_nce: 1.0
+  w_list: 1.0
+  w_qat: 1.0
+  qat_ramp: 0.3
+  false_negative_margin: 0.0
+  matryoshka_dims: [2048, 1024, 768, 512, 256, 128, 64, 32]
+  binary_dims: [1024, 512, 256, 128, 64]
+  grad_checkpointing: true
