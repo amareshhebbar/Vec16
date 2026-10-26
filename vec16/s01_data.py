@@ -61,13 +61,7 @@ def build_pairs(cfg):
             docs[text] = len(docs)
         return docs[text]
 
-    for i, src in enumerate(cfg["sources"]):
-        need = math.ceil(total * src["share"] / shares * 1.25)
-        try:
-            pairs = take_pairs(src, need, seed=i)
-        except Exception as ex:
-            log(f"skip source {src['key']}: {type(ex).__name__}: {ex}")
-            continue
+    def add(src, pairs):
         kept = 0
         for q, p, n in pairs:
             if q in seen_q:
@@ -75,7 +69,33 @@ def build_pairs(cfg):
             seen_q.add(q)
             rows.append({"query": q, "pos": doc_id(p), "neg": doc_id(n) if n and n != p else None, "src": src["key"]})
             kept += 1
-        log(f"source {src['key']}: {kept} queries")
+        return kept
+
+    asked = {}
+    for i, src in enumerate(cfg["sources"]):
+        need = math.ceil(total * src["share"] / shares * 1.25)
+        try:
+            pairs = take_pairs(src, need, seed=i)
+        except Exception as ex:
+            log(f"skip source {src['key']}: {type(ex).__name__}: {ex}")
+            continue
+        asked[i] = need
+        log(f"source {src['key']}: {add(src, pairs)} queries")
+    fillers = [i for i, s in enumerate(cfg["sources"]) if s.get("fill") and i in asked]
+    rounds = 0
+    while len(rows) < total and fillers and rounds < 3:
+        rounds += 1
+        short = total - len(rows)
+        for i in fillers:
+            src = cfg["sources"][i]
+            extra = math.ceil(short / len(fillers) * 1.3)
+            asked[i] += extra
+            try:
+                got = add(src, take_pairs(src, asked[i], seed=i))
+            except Exception as ex:
+                log(f"fill from {src['key']} failed: {ex}")
+                continue
+            log(f"fill round {rounds} from {src['key']}: {got} more queries")
     if len(rows) < total:
         log(f"only {len(rows)} queries available, wanted {total}")
     rng.shuffle(rows)
