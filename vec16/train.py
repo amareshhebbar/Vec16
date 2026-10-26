@@ -23,6 +23,7 @@ from vec16.common import (
     run_dir,
     seed_all,
     train_precision,
+    train_queries,
     variant_spec,
     write_json,
 )
@@ -97,7 +98,7 @@ def embed(st, texts, dev):
 
 
 class Data:
-    def __init__(self, cfg):
+    def __init__(self, cfg, limit=None):
         data, tdir = cfg["paths"]["data"], cfg["paths"]["teacher"]
         self.queries = read_jsonl(data / "queries.jsonl")
         self.corpus = [c["text"] for c in read_jsonl(data / "corpus.jsonl")]
@@ -105,6 +106,8 @@ class Data:
         self.dense = np.load(tdir / "dense.npy").astype(np.float32)
         self.colbert = np.load(tdir / "colbert.npy").astype(np.float32)
         self.train = [i for i, q in enumerate(self.queries) if q["split"] == "train"]
+        if limit:
+            self.train = self.train[:limit]
         self.dev = [i for i, q in enumerate(self.queries) if q["split"] == "dev"]
 
 
@@ -148,7 +151,7 @@ def run_one(cfg, mkey, vname, seed, teacher, batch_override=None):
         st[0].auto_model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     st.to(dev)
     st.train()
-    data = Data(cfg)
+    data = Data(cfg, train_queries(cfg, mkey, spec))
     full = st.get_sentence_embedding_dimension()
     dims, bdims = mrl_dims(cfg, full), bin_dims(cfg, full)
     bits = headline_bits(cfg)
