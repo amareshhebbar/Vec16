@@ -51,34 +51,34 @@ def main():
     cand = np.load(tdir / "cand.npy")
     model = load_colbert(cfg)
     bs = run["teacher_batch"]
-    doc_cache = tdir / "colbert_docs.pt"
-    if doc_cache.exists():
-        docs = torch.load(doc_cache)
-    else:
-        docs = []
-        texts = [c["text"] for c in corpus]
-        step = 20000
-        for i in range(0, len(texts), step):
-            docs += encode_tokens(model, texts[i : i + step], False, bs)
-            log(f"colbert docs {min(i + step, len(texts))}/{len(texts)}")
-        torch.save(docs, doc_cache)
     dev = device()
+    parts = tdir / "colbert_parts"
+    parts.mkdir(exist_ok=True)
     scores = np.zeros(cand.shape, dtype=np.float32)
     chunk = run["colbert_chunk"]
     inner = 32
+    texts = [c["text"] for c in corpus]
     for start in range(0, len(queries), chunk):
-        qt = encode_tokens(model, [r["query"] for r in queries[start : start + chunk]], True, bs)
+        part = parts / f"part_{start // chunk:05d}.npy"
+        stop = min(start + chunk, len(queries))
+        if part.exists():
+            scores[start:stop] = np.load(part)
+            continue
+        need = sorted({int(c) for c in cand[start:stop].reshape(-1)})
+        enc = encode_tokens(model, [texts[c] for c in need], False, bs)
+        docs = dict(zip(need, enc))
+        qt = encode_tokens(model, [r["query"] for r in queries[start:stop]], True, bs)
         for j in range(0, len(qt), inner):
-            rows = range(start + j, min(start + j + inner, len(queries)))
+            rows = range(start + j, min(start + j + inner, stop))
             qx, qm = padded(qt[j : j + inner], dev)
             flat = [docs[int(c)] for r in rows for c in cand[r]]
             dx, dm = padded(flat, dev)
             b, k = len(rows), cand.shape[1]
             dx = dx.view(b, k, dx.shape[1], dx.shape[2])
             dm = dm.view(b, k, dm.shape[1])
-            s = maxsim(qx, qm.float(), dx, dm)
-            scores[start + j : start + j + b] = s.cpu().numpy()
-        log(f"colbert queries {min(start + chunk, len(queries))}/{len(queries)}")
+            scores[start + j : start + j + b] = maxsim(qx, qm.float(), dx, dm).cpu().numpy()
+        np.save(part, scores[start:stop])
+        log(f"colbert queries {stop}/{len(queries)}, {len(need)} passages encoded for this chunk")
     model = None
     release()
     np.save(tdir / "colbert.npy", scores.astype(np.float16))
