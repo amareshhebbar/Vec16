@@ -1,4 +1,5 @@
 import argparse
+import platform
 from pathlib import Path
 
 import numpy as np
@@ -44,19 +45,52 @@ def export(model_path, out_dir):
             torch.onnx.export(wrap, args, str(target), opset_version=17, dynamic_axes=axes, do_constant_folding=True, **names)
     parity = check(target, feats, ref)
     log(f"onnx fp32 parity cosine {parity:.6f}")
-    info = {"fp32": {"file": "onnx/model.onnx", "parity_cosine": parity}}
+    info = {"cpu_name": platform.processor() or platform.machine(), "fp32": {"file": "onnx/model.onnx", "parity_cosine": parity}}
+    try:
+        info["fp32"]["cpu"] = speed(target, st.tokenizer)
+        log(f"onnx fp32 cpu {info['fp32']['cpu']['docs_per_second']} docs per second")
+    except Exception as ex:
+        log(f"speed test skipped: {ex}")
     try:
         from onnxruntime.quantization import QuantType, quantize_dynamic
 
         qt = out_dir / "model_quantized.onnx"
         quantize_dynamic(str(target), str(qt), weight_type=QuantType.QInt8)
         qp = check(qt, feats, ref)
-        info["int8"] = {"file": "onnx/model_quantized.onnx", "parity_cosine": qp}
+        info["int8"] = {"file": "onnx/model_quantized.onnx", "parity_cosine": qp, "cpu": speed(qt, st.tokenizer)}
+        log(f"onnx int8 cpu {info['int8']['cpu']['docs_per_second']} docs per second")
         log(f"onnx int8 parity cosine {qp:.6f}")
     except Exception as ex:
         log(f"int8 quantization skipped: {type(ex).__name__}: {ex}")
     write_json(out_dir / "export.json", info)
     return info
+
+
+def speed(path, tok, n=256, batch=32, words=100):
+    import os
+    import random
+    import time
+
+    import onnxruntime as ort
+
+    rng = random.Random(0)
+    vocab = "the of and to in is was for on that with as by at from his her it an are were which this be or has had not first new one can after also two more time".split()
+    texts = ["passage: " + " ".join(rng.choice(vocab) for _ in range(words)) for _ in range(n)]
+    opts = ort.SessionOptions()
+    threads = os.cpu_count() or 1
+    opts.intra_op_num_threads = threads
+    sess = ort.InferenceSession(str(path), sess_options=opts, providers=["CPUExecutionProvider"])
+
+    def run(chunk):
+        b = tok(chunk, padding=True, truncation=True, max_length=256, return_tensors="np")
+        sess.run(["sentence_embedding"], {"input_ids": b["input_ids"].astype(np.int64), "attention_mask": b["attention_mask"].astype(np.int64)})
+
+    run(texts[:batch])
+    t0 = time.time()
+    for i in range(0, n, batch):
+        run(texts[i : i + batch])
+    dt = time.time() - t0
+    return {"docs_per_second": round(n / dt, 1), "threads": threads, "batch": batch, "words_per_doc": words}
 
 
 def check(path, feats, ref):
