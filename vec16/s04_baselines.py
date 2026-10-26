@@ -1,13 +1,57 @@
 import traceback
 
 from vec16.common import bin_dims, device, eval_dtype, hf_login, load_cfg, log, model_kwargs, mrl_dims, release, update_status, write_json
-from vec16.retrieval import evaluate_nano
+from vec16.retrieval import evaluate_nano, evaluate_nano_late
 
 
 def baseline_dims(cfg, bcfg, full):
     if bcfg.get("mrl"):
         return mrl_dims(cfg, full), sorted(set(bin_dims(cfg, full)) | {full}, reverse=True)
     return [full], [full]
+
+
+def teachers(cfg, res):
+    from sentence_transformers import SentenceTransformer
+
+    fails = []
+    tc = cfg["teachers"]
+    out = res / "teacher_dense.json"
+    if not out.exists():
+        tid = cfg["run"]["teacher_dense"]
+        log(f"teacher {tid} on NanoBEIR")
+        model = None
+        try:
+            model = SentenceTransformer(tid, device=device(), model_kwargs=model_kwargs(eval_dtype()), trust_remote_code=True)
+            model.max_seq_length = 512
+            full = model.get_sentence_embedding_dimension()
+            r = evaluate_nano(cfg, model, tc.get("dense_query_prompt", ""), tc.get("dense_doc_prompt", ""), mrl_dims(cfg, full), sorted(set(bin_dims(cfg, full)) | {full}, reverse=True))
+            r.update(key="teacher_dense", id=tid, label=f"teacher {tid.split('/')[-1]}", dim=full, mrl=True)
+            write_json(out, r)
+        except Exception as ex:
+            fails.append({"baseline": "teacher_dense", "error": repr(ex)})
+            traceback.print_exc()
+        finally:
+            model = None
+            release()
+    out = res / "teacher_colbert.json"
+    if not out.exists():
+        log(f"teacher {tc['colbert']} on NanoBEIR")
+        model = None
+        try:
+            from vec16.s03_teacher_colbert import load_colbert
+
+            model = load_colbert(cfg)
+            r = evaluate_nano_late(cfg, model, cfg["run"]["eval_batch"])
+            r.update(key="teacher_colbert", id=tc["colbert"], label=f"teacher {tc['colbert'].split('/')[-1]}")
+            write_json(out, r)
+            log(f"colbert teacher nDCG@10 {r['late']:.4f}, {r['bytes_per_doc']:.0f} bytes per document")
+        except Exception as ex:
+            fails.append({"baseline": "teacher_colbert", "error": repr(ex)})
+            traceback.print_exc()
+        finally:
+            model = None
+            release()
+    return fails
 
 
 def main():
@@ -40,6 +84,7 @@ def main():
         finally:
             model = None
             release()
+    fails += teachers(cfg, res)
     write_json(res / "baseline_failures.json", fails)
     update_status(cfg, "baselines", {"done": len(cfg["run"]["baselines"]) - len(fails), "failed": len(fails)})
 
