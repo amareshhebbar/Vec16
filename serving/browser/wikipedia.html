@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vec16 Wikipedia Search</title>
+<style>
+:root{--bg:#f7f7f5;--card:#ffffff;--ink:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--warm:#ea580c}
+@media (prefers-color-scheme: dark){:root{--bg:#111315;--card:#1a1d21;--ink:#e5e7eb;--muted:#9ca3af;--line:#2a2f36;--accent:#60a5fa;--warm:#fb923c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:28px 16px 64px}
+h1{font-size:24px;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 18px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+.bar{display:flex;gap:10px}
+input{flex:1;min-width:0;padding:11px 12px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:0 18px;font:inherit;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#status{color:var(--muted);font-size:13px;margin-top:10px;min-height:20px}
+progress{width:100%;height:6px;margin-top:8px}
+.hit{border-top:1px solid var(--line);padding:12px 0}
+.hit:first-child{border-top:0}
+.hit a{color:var(--accent);font-weight:600;text-decoration:none}
+.hit p{margin:4px 0 0}
+.meta{font-size:12px;color:var(--muted);font-family:ui-monospace,monospace}
+.stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.stat{background:var(--bg);border-radius:8px;padding:10px}
+.stat b{display:block;font-size:18px}
+.stat span{font-size:12px;color:var(--muted)}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+</head>
+<body>
+<main>
+<h1>Search Wikipedia in this tab</h1>
+<p class="sub">__COUNT__ passages, 16 bytes each, __MB__ MB in total. The query is embedded and compared by Hamming distance on your device. Nothing is sent to a server.</p>
+<div class="card">
+<div class="bar"><input id="q" placeholder="ask anything, for example: why is the sky blue" autofocus><button id="go" disabled>Search</button></div>
+<progress id="prog" max="1" value="0"></progress>
+<div id="status">loading</div>
+</div>
+<div class="card stats" id="stats" hidden></div>
+<div class="card" id="results" hidden></div>
+<p class="sub">Model <a href="https://huggingface.co/__MODEL_REPO__">__MODEL_REPO__</a> · index <a href="https://huggingface.co/datasets/__INDEX_REPO__">__INDEX_REPO__</a></p>
+</main>
+<script type="module">
+import { AutoTokenizer } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1";
+
+const MODEL = "__MODEL_REPO__";
+const INDEX = "__INDEX_REPO__";
+const base = `https://huggingface.co/datasets/${INDEX}/resolve/main`;
+const $ = (id) => document.getElementById(id);
+const state = {};
+const shardCache = new Map();
+
+async function fetchBytes(url, label) {
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`${label}: HTTP ${res.status}`);
+  const total = Number(res.headers.get("content-length")) || 0;
+  const reader = res.body.getReader();
+  const parts = [];
+  let got = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    parts.push(value);
+    got += value.length;
+    if (total) { $("prog").value = got / total; $("status").textContent = `${label} ${(got / 1048576).toFixed(0)} of ${(total / 1048576).toFixed(0)} MB`; }
+  }
+  const out = new Uint8Array(got);
+  let o = 0;
+  for (const p of parts) { out.set(p, o); o += p.length; }
+  return out;
+}
+
+function popcount32(x) {
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  return (((x + (x >>> 4)) & 0x0f0f0f0f) * 0x01010101) >>> 24;
+}
+
+function pack(vec, bits) {
+  const bytes = new Uint8Array(bits / 8);
+  for (let i = 0; i < bits; i++) if (vec[i] > 0) bytes[i >> 3] |= 128 >> (i & 7);
+  return bytes;
+}
+
+function topk(codes, q, words, n, k) {
+  const best = new Int32Array(k).fill(-1);
+  const dist = new Int32Array(k).fill(1 << 30);
+  let worst = 1 << 30, wi = 0;
+  for (let i = 0; i < n; i++) {
+    let d = 0;
+    const o = i * words;
+    for (let w = 0; w < words; w++) d += popcount32(codes[o + w] ^ q[w]);
+    if (d < worst) {
+      best[wi] = i; dist[wi] = d;
+      worst = -1;
+      for (let j = 0; j < k; j++) if (dist[j] > worst) { worst = dist[j]; wi = j; }
+    }
+  }
+  return Array.from(best, (id, j) => ({ id, d: dist[j] })).filter((x) => x.id >= 0).sort((a, b) => a.d - b.d);
+}
+
+async function shard(sid) {
+  if (!shardCache.has(sid)) shardCache.set(sid, fetch(`${base}/shards/${String(sid).padStart(5, "0")}.json`).then((r) => r.json()));
+  return shardCache.get(sid);
+}
+
+async function init() {
+  const meta = await (await fetch(`${base}/meta.json`)).json();
+  state.meta = meta;
+  const raw = await fetchBytes(`${base}/codes.bin`, "index");
+  state.codes = new Uint32Array(raw.buffer, 0, raw.length / 4);
+  state.words = meta.bits / 32;
+  $("status").textContent = "loading model";
+  state.tok = await AutoTokenizer.from_pretrained(MODEL);
+  const onnx = await fetchBytes(`https://huggingface.co/${MODEL}/resolve/main/onnx/model_quantized.onnx`, "model");
+  state.sess = await ort.InferenceSession.create(onnx, { executionProviders: ["wasm"] });
+  $("prog").value = 1;
+  $("status").textContent = `ready: ${meta.count.toLocaleString()} passages in ${(raw.length / 1048576).toFixed(0)} MB`;
+  $("go").disabled = false;
+}
+
+async function search() {
+  const text = $("q").value.trim();
+  if (!text || !state.sess) return;
+  $("go").disabled = true;
+  const t0 = performance.now();
+  const enc = await state.tok([state.meta.query_prompt + text], { padding: true, truncation: true, max_length: 64 });
+  const out = await state.sess.run({
+    input_ids: new ort.Tensor("int64", enc.input_ids.data, enc.input_ids.dims),
+    attention_mask: new ort.Tensor("int64", enc.attention_mask.data, enc.attention_mask.dims),
+  }, ["sentence_embedding"]);
+  const t1 = performance.now();
+  const qb = pack(out.sentence_embedding.data, state.meta.bits);
+  const q32 = new Uint32Array(qb.buffer);
+  const hits = topk(state.codes, q32, state.words, state.meta.count, 10);
+  const t2 = performance.now();
+  const rows = await Promise.all(hits.map(async (h) => {
+    const s = await shard(Math.floor(h.id / state.meta.shard_size));
+    return { ...h, row: s[h.id % state.meta.shard_size] };
+  }));
+  const t3 = performance.now();
+  const box = $("results");
+  box.hidden = false;
+  box.innerHTML = "";
+  for (const r of rows) {
+    const [title, snip] = r.row;
+    const div = document.createElement("div");
+    div.className = "hit";
+    const a = document.createElement("a");
+    a.href = `https://en.wikipedia.org/wiki/${encodeURIComponent(title.replace(/ /g, "_"))}`;
+    a.target = "_blank";
+    a.textContent = title;
+    const p = document.createElement("p");
+    p.textContent = snip;
+    const m = document.createElement("div");
+    m.className = "meta";
+    m.textContent = `Hamming distance ${r.d} of ${state.meta.bits}`;
+    div.append(a, p, m);
+    box.appendChild(div);
+  }
+  const st = $("stats");
+  st.hidden = false;
+  st.innerHTML = `<div class="stat"><b>${(t1 - t0).toFixed(0)} ms</b><span>embed the query</span></div><div class="stat"><b>${(t2 - t1).toFixed(0)} ms</b><span>scan ${state.meta.count.toLocaleString()} codes</span></div><div class="stat"><b>${(t3 - t2).toFixed(0)} ms</b><span>fetch text of 10 hits</span></div><div class="stat"><b>${state.meta.bits / 8} bytes</b><span>per passage</span></div>`;
+  $("go").disabled = false;
+}
+
+$("go").addEventListener("click", search);
+$("q").addEventListener("keydown", (e) => { if (e.key === "Enter") search(); });
+init().catch((e) => { $("status").textContent = "error: " + e.message; });
+</script>
+</body>
+</html>
