@@ -9,7 +9,7 @@ def main():
         return
     st = read_json(p)
     print(f"work {cfg['paths']['work']}  updated {st.get('updated')}")
-    for key in ("env", "data", "teacher_dense", "teacher_colbert", "baselines", "dataset", "finalize"):
+    for key in ("env", "data", "teacher_dense", "teacher_colbert", "baselines", "dataset", "bench", "demo", "finalize"):
         if key in st:
             print(f"{key:16} {st[key]}")
     models = st.get("models", {})

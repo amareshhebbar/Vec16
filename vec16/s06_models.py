@@ -13,9 +13,10 @@ from vec16.common import (
     read_json,
     repo_name,
     run_dir,
+    scale_variants,
     write_json,
 )
-from vec16.summary import baseline_results, model_summary, select_headline
+from vec16.summary import SPLITS, baseline_results, model_summary, select_headline
 
 
 def sub(mod, *args):
@@ -60,16 +61,32 @@ def plan(cfg, m):
     if m in (run.get("ablation_models") or []):
         for a in cfg["ablations"]:
             train(cfg, m, a, s0, head["teacher"])
+    default_n = cfg["models"][m].get("train_queries") or run.get("train_queries")
+    for v in scale_variants(cfg, m):
+        if default_n and int(v.split("_")[1]) == int(default_n):
+            continue
+        train(cfg, m, v, s0, head["teacher"])
     return head
 
 
 def finished_runs(cfg, m):
     out = []
-    for v in list(cfg["variants"]) + list(cfg["ablations"]):
+    for v in list(cfg["variants"]) + list(cfg["ablations"]) + scale_variants(cfg, m):
         for s in cfg["run"]["seeds"]:
             if (run_dir(cfg, m, v, s) / "done.json").exists():
                 out.append(f"{v}:{s}")
     return out
+
+
+def teacher_plot_args(s):
+    ts = s.get("teacher_scores") or {}
+    key = SPLITS[s["split"]]
+    teacher = ("dense teacher", ts["teacher_dense"]) if "teacher_dense" in ts else None
+    late = None
+    if "teacher_colbert" in ts:
+        c = ts["teacher_colbert"]
+        late = ("ColBERT teacher", c.get("late_ood" if key == "mean_ood" else "late") or c.get("late"), c["bytes_per_doc"])
+    return key, teacher, late
 
 
 def draw(cfg, m, s):
@@ -79,9 +96,11 @@ def draw(cfg, m, s):
     present = []
     bres = baseline_results(cfg)
     bl = [(r["label"], r, r.get("mrl")) for r in bres.values()]
-    charts.curve(adir / "curve.png", [(f"Vec16 {tail}", s["main"])], bl, s["bits"])
+    key, teacher, late = teacher_plot_args(s)
+    where = "out of domain sets" if s["split"] == "ood" else "all sets"
+    charts.curve(adir / "curve.png", [(f"Vec16 {tail}", s["main"])], bl, s["bits"], f"Quality against bytes per document, NanoBEIR {where}", key, teacher, late)
     present.append("curve.png")
-    charts.mrl(adir / "mrl.png", f"Vec16 {tail}", s["main"], s["base"])
+    charts.mrl(adir / "mrl.png", f"Vec16 {tail}", s["main"], s["base"], key)
     present.append("mrl.png")
     if s["teachers"]:
         names = list(s["teachers"])
@@ -91,6 +110,11 @@ def draw(cfg, m, s):
         names = list(s["ablations"])
         charts.bars(adir / "ablation.png", "What each part adds", names, [("float32 full", [s["ablations"][n]["float"] or 0 for n in names]), (f"binary {s['bits']} bits", [s["ablations"][n]["binary"] or 0 for n in names])])
         present.append("ablation.png")
+    if len(s.get("scaling") or []) >= 2:
+        pts = s["scaling"]
+        xs = [p["queries"] for p in pts]
+        charts.scaling(adir / "data_scaling.png", f"Vec16 {tail}: more training queries", "training queries (log scale)", [("float32 full", xs, [p["float"] or 0 for p in pts]), (f"binary {s['bits']} bits", xs, [p["binary"] or 0 for p in pts])])
+        present.append("data_scaling.png")
     log_p = run_dir(cfg, m, s["headline"]["variant"], s["best_seed"]) / "train_log.json"
     if log_p.exists():
         charts.loss_curve(adir / "loss.png", f"Vec16 {tail}", read_json(log_p))
@@ -124,6 +148,9 @@ def banner(cfg, m, s, private):
     log(f"  starting LLM float32 nDCG@10   {(s['base_float'] or 0) * 100:.1f}")
     log(f"  Vec16 float32 {s['full_dim']:<5} nDCG@10   {t['float']['mean'] * 100:.1f}")
     log(f"  Vec16 binary {s['bits']} bits nDCG@10   {t['binary']['mean'] * 100:.1f}  ({s['bits'] // 8} bytes per document)")
+    if t.get("rescore"):
+        log(f"  binary, top {cfg['run'].get('rescore_top', 100)} rescored    {t['rescore']['mean'] * 100:.1f}")
+    log(f"  scored on {'out of domain NanoBEIR sets' if s['split'] == 'ood' else 'all NanoBEIR sets'}")
     if s.get("reference_float") is not None:
         log(f"  reference {s['reference']} float32   {s['reference_float'] * 100:.1f}")
     log(f"  teacher used: {s['headline']['teacher']}   seeds: {t['float']['n']}   gpu hours: {s['gpu_hours']}")
@@ -174,6 +201,8 @@ def process(cfg, m, a):
         "float": t["float"]["mean"],
         "binary": t["binary"]["mean"],
         "asym": t["asym"]["mean"] if t["asym"] else None,
+        "rescore": t["rescore"]["mean"] if t.get("rescore") else None,
+        "split": s["split"],
         "base_float": s["base_float"],
         "gpu_hours": s["gpu_hours"],
         "onnx": bool(onnx),
