@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Vec16 Browser Search</title>
+<style>
+:root{--bg:#f7f7f5;--card:#ffffff;--ink:#1f2937;--muted:#6b7280;--line:#e5e7eb;--accent:#2563eb;--warm:#ea580c}
+@media (prefers-color-scheme: dark){:root{--bg:#111315;--card:#1a1d21;--ink:#e5e7eb;--muted:#9ca3af;--line:#2a2f36;--accent:#60a5fa;--warm:#fb923c}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,sans-serif}
+main{max-width:860px;margin:0 auto;padding:24px 16px 64px}
+h1{font-size:22px;margin:0 0 4px}
+p.sub{color:var(--muted);margin:0 0 20px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px;margin-bottom:16px}
+label{display:block;font-size:13px;color:var(--muted);margin:0 0 6px}
+input,textarea,select{width:100%;padding:9px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink);font:inherit}
+textarea{min-height:150px;resize:vertical}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row>div{flex:1;min-width:200px}
+button{background:var(--accent);color:#fff;border:0;border-radius:8px;padding:10px 16px;font:inherit;cursor:pointer}
+button:disabled{opacity:.5;cursor:default}
+#status{color:var(--muted);font-size:13px;margin-top:10px;min-height:20px}
+.hit{border-top:1px solid var(--line);padding:10px 0}
+.hit:first-child{border-top:0}
+.meta{font-size:12px;color:var(--muted);font-family:ui-monospace,monospace;word-break:break-all}
+.dist{color:var(--warm);font-weight:600}
+</style>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+</head>
+<body>
+<main>
+<h1>Vec16 in the browser</h1>
+<p class="sub">Every document becomes 128 bits, 16 bytes. Search is Hamming distance. Nothing leaves this page.</p>
+<div class="card">
+<div class="row">
+<div><label for="repo">Model repo</label><input id="repo" value="AmareshHebbar/Vec16_SmolLM2_135M"></div>
+<div><label for="bits">Bits per document</label><select id="bits"><option>64</option><option selected>128</option><option>256</option><option>512</option></select></div>
+</div>
+</div>
+<div class="card">
+<label for="docs">Documents, one per line</label>
+<textarea id="docs">Vaccines show the immune system a harmless piece of a pathogen so it reacts faster later.
+The Eiffel Tower was finished in 1889 for the World's Fair in Paris.
+Binary embeddings store one bit per dimension and are compared with Hamming distance.
+Photosynthesis turns light, water and carbon dioxide into sugar and oxygen.
+A mortgage is a loan where the house itself is the security.
+Rust prevents data races at compile time through ownership and borrowing.</textarea>
+<div style="height:12px"></div>
+<label for="query">Query</label>
+<input id="query" value="how does a vaccine work">
+<div style="height:12px"></div>
+<button id="go">Load model and search</button>
+<div id="status"></div>
+</div>
+<div class="card" id="results" hidden></div>
+</main>
+<script type="module">
+import { AutoTokenizer } from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1";
+
+const QUERY = "query: ";
+const DOC = "passage: ";
+let loaded = { repo: null, tok: null, sess: null };
+const $ = (id) => document.getElementById(id);
+
+async function load(repo) {
+  if (loaded.repo === repo) return loaded;
+  $("status").textContent = "downloading tokenizer and int8 model";
+  const tok = await AutoTokenizer.from_pretrained(repo);
+  const url = `https://huggingface.co/${repo}/resolve/main/onnx/model_quantized.onnx`;
+  const sess = await ort.InferenceSession.create(url, { executionProviders: ["wasm"] });
+  loaded = { repo, tok, sess };
+  return loaded;
+}
+
+async function embed(m, texts) {
+  const enc = await m.tok(texts, { padding: true, truncation: true, max_length: 256 });
+  const feeds = {
+    input_ids: new ort.Tensor("int64", enc.input_ids.data, enc.input_ids.dims),
+    attention_mask: new ort.Tensor("int64", enc.attention_mask.data, enc.attention_mask.dims),
+  };
+  const out = await m.sess.run(feeds, ["sentence_embedding"]);
+  const t = out.sentence_embedding;
+  const [n, d] = t.dims;
+  return Array.from({ length: n }, (_, i) => t.data.slice(i * d, (i + 1) * d));
+}
+
+function pack(vec, bits) {
+  const bytes = new Uint8Array(bits / 8);
+  for (let i = 0; i < bits; i++) if (vec[i] > 0) bytes[i >> 3] |= 128 >> (i & 7);
+  return bytes;
+}
+
+function hamming(a, b) {
+  let h = 0;
+  for (let i = 0; i < a.length; i++) {
+    let x = a[i] ^ b[i];
+    while (x) { h += x & 1; x >>= 1; }
+  }
+  return h;
+}
+
+const hex = (b) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+
+$("go").addEventListener("click", async () => {
+  $("go").disabled = true;
+  try {
+    const m = await load($("repo").value.trim());
+    const bits = parseInt($("bits").value, 10);
+    const docs = $("docs").value.split("\n").map((s) => s.trim()).filter(Boolean);
+    $("status").textContent = `embedding ${docs.length} documents`;
+    const t0 = performance.now();
+    const dv = await embed(m, docs.map((d) => DOC + d));
+    const [qv] = await embed(m, [QUERY + $("query").value]);
+    const codes = dv.map((v) => pack(v, bits));
+    const qc = pack(qv, bits);
+    const ranked = docs.map((d, i) => ({ d, h: hamming(qc, codes[i]), c: codes[i] })).sort((a, b) => a.h - b.h);
+    const ms = (performance.now() - t0).toFixed(0);
+    $("status").textContent = `${bits} bits = ${bits / 8} bytes per document, ${ms} ms on this device`;
+    const box = $("results");
+    box.hidden = false;
+    box.innerHTML = "";
+    for (const r of ranked) {
+      const div = document.createElement("div");
+      div.className = "hit";
+      div.innerHTML = `<div><span class="dist">${r.h}</span> &nbsp;${r.d.replace(/</g, "&lt;")}</div><div class="meta">${hex(r.c)}</div>`;
+      box.appendChild(div);
+    }
+  } catch (e) {
+    $("status").textContent = "error: " + e.message;
+  } finally {
+    $("go").disabled = false;
+  }
+});
+</script>
+</body>
+</html>
